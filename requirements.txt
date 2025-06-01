@@ -1,2 +1,10 @@
-python-telegram-bot==20.7
-requests==2.31.0
+# For the Telegram Bot API interaction
+python-telegram-bot>=20.0,<21.0
+
+# For making HTTP requests to remove.bg and DeepAI APIs
+requests>=2.25.0
+
+# For timezone support (often a dependency for libraries like APScheduler,
+# which is used internally by python-telegram-bot)
+# Explicitly listing it due to previous Pydroid 3 troubleshooting.
+pytz>=2023.3
