@@ -1,6 +1,7 @@
 import logging
 import io
 import requests
+import asyncio  # <-- Add this import at the top
 
 from telegram import Update, InputFile, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
@@ -67,45 +68,70 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get(STATE_WAITING_FOR_IMAGE) is True:
         logger.info(f"User {user_id} sent a photo while in WAITING_FOR_IMAGE state. Processing...")
-        await message.reply_text("Processing your image, please wait...", reply_markup=get_main_keyboard())
+
+        # First send progress message
+        progress_msg = await message.reply_text(
+            "🟩⬜️⬜️⬜️⬜️⬜️⬜️⬜️⬜️ 0%\nProcessing your image...",
+            reply_markup=get_main_keyboard()
+        )
+
+        # Fake progress updates before sending to remove.bg
+        steps = [
+            ("🟩⬜️⬜️⬜️⬜️⬜️⬜️⬜️⬜️ 5%", 0.5),
+            ("🟩🟩⬜️⬜️⬜️⬜️⬜️⬜️⬜️ 15%", 0.7),
+            ("🟩🟩🟩⬜️⬜️⬜️⬜️⬜️⬜️ 25%", 0.7),
+            ("🟩🟩🟩🟩⬜️⬜️⬜️⬜️⬜️ 40%", 0.7),
+            ("🟩🟩🟩🟩🟩⬜️⬜️⬜️⬜️ 55%", 0.7),
+            ("🟩🟩🟩🟩🟩🟩⬜️⬜️⬜️ 70%", 0.7),
+            ("🟩🟩🟩🟩🟩🟩🟩⬜️⬜️ 85%", 0.7),
+            ("🟩🟩🟩🟩🟩🟩🟩🟩⬜️⬜️ 95%", 0.5), # Corrected for 95%
+        ]
+
+        for text, delay in steps:
+            await asyncio.sleep(delay)
+            try:
+                # Always provide reply_markup when editing a message that has one
+                await progress_msg.edit_text(text, reply_markup=get_main_keyboard())
+            except Exception:
+                # If user deleted the message, ignore the error
+                pass 
         
+        # --- Actual Image Processing Logic (Moved and integrated here) ---
         photo_file_id = message.photo[-1].file_id # Get the largest available photo from Telegram
         
+        image_byte_array = None # Initialize to None for error handling
+
         try:
+            # Update progress message before downloading
+            try:
+                await progress_msg.edit_text("🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 100%\nDownloading image...", reply_markup=get_main_keyboard())
+            except Exception:
+                pass # Ignore if message was deleted
+
             photo_file_obj = await context.bot.get_file(photo_file_id)
-        except Exception as e:
-            logger.error(f"Error getting file object from Telegram for file_id {photo_file_id}: {e}")
-            await message.reply_text("Sorry, I couldn't download the image details. Please try again.", reply_markup=get_main_keyboard())
-            context.user_data[STATE_WAITING_FOR_IMAGE] = False
-            return
+            image_byte_array = await photo_file_obj.download_as_bytearray()
+            image_bytes_io = io.BytesIO(image_byte_array)
+            original_filename = photo_file_obj.file_path.split('/')[-1] if photo_file_obj.file_path else 'input_image.jpg'
+            image_bytes_io.name = original_filename
 
-        image_byte_array = await photo_file_obj.download_as_bytearray()
-        image_bytes_io = io.BytesIO(image_byte_array)
-        # Give it a name; helps some APIs, though remove.bg autodetects format.
-        # The extension doesn't force input type, just a good practice for multipart forms.
-        original_filename = photo_file_obj.file_path.split('/')[-1] if photo_file_obj.file_path else 'input_image.jpg'
-        image_bytes_io.name = original_filename
+            logger.info(f"Downloaded image for processing: {original_filename}, size: {len(image_byte_array)} bytes.")
 
-        logger.info(f"Downloaded image for processing: {original_filename}, size: {len(image_byte_array)} bytes.")
+            # Update progress message before calling remove.bg API
+            try:
+                await progress_msg.edit_text("🔥 Sending to remove.bg API...", reply_markup=get_main_keyboard())
+            except Exception:
+                pass
 
-        headers = {'X-Api-Key': REMOVE_BG_API_KEY}
-        # 'size': 'auto' - Tries to deliver the best quality for the account type.
-        # For free accounts, this is typically a preview image (around 0.25 megapixels).
-        # 'format': 'png' - For transparent background.
-        # Other options for 'size' (mostly for paid plans): 'full', 'hd', '4k', or specific dimensions like '800x600'.
-        # Using 'full' on a free plan will likely result in an error or still give a preview.
-        data_payload = {
-            'format': 'png',
-            'size': 'auto', # This is usually the best for free tier to get largest preview
-            # 'crop': 'true' # Example: if you want to crop away empty transparent space
-            # 'add_shadow': 'true' # Example: if you wanted a shadow effect (paid feature often)
-        }
-        files_payload = {'image_file': image_bytes_io}
-        
-        try:
+            headers = {'X-Api-Key': REMOVE_BG_API_KEY}
+            data_payload = {
+                'format': 'png',
+                'size': 'auto',
+            }
+            files_payload = {'image_file': image_bytes_io}
+            
             logger.info(f"Sending image to remove.bg API with payload: {data_payload}")
             response = requests.post(REMOVE_BG_API_URL, headers=headers, files=files_payload, data=data_payload, timeout=45) # Increased timeout slightly
-            response.raise_for_status()
+            response.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
             processed_image_bytes = response.content
             
             output_filename = 'bg_removed.png'
@@ -113,21 +139,27 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if 'image/png' not in content_type_header:
                 logger.warning(f"remove.bg did NOT return a PNG as expected. Content-Type: {content_type_header}. This might be an error image or wrong format.")
-                # If it's an error image, it might be HTML or JSON.
-                # Let's try to see if it's an image at all, otherwise, don't send as document.
-                if "image/" in content_type_header:
+                if "image/" in content_type_header: # If it's still an image but wrong type
                     extension = content_type_header.split('/')[-1]
                     output_filename = f'bg_removed_output.{extension}'
-                else: # Not an image, likely an error message from API
+                else: # Definitely not an image, likely an error from API despite status 200
                     error_text_from_api = processed_image_bytes.decode('utf-8', errors='ignore')[:500]
                     logger.error(f"remove.bg returned non-image content: {error_text_from_api}")
-                    await message.reply_text(f"Sorry, remove.bg returned an unexpected response. It might be an error: {error_text_from_api}", reply_markup=get_main_keyboard())
+                    await progress_msg.edit_text(
+                        f"Sorry, remove.bg returned an unexpected response. It might be an error: {error_text_from_api}",
+                        reply_markup=get_main_keyboard()
+                    )
                     context.user_data[STATE_WAITING_FOR_IMAGE] = False
                     return
 
-
             logger.info(f"Received processed image from remove.bg, size: {len(processed_image_bytes)} bytes. Content-Type: {content_type_header}")
 
+            # Final update before sending the image
+            try:
+                await progress_msg.edit_text("✅ Processing Completed!\nSending your result...", reply_markup=get_main_keyboard())
+            except Exception:
+                pass
+            
             await context.bot.send_document(
                 chat_id=message.chat_id,
                 document=InputFile(io.BytesIO(processed_image_bytes), filename=output_filename),
@@ -136,31 +168,46 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         except requests.exceptions.HTTPError as e:
-            error_message = f"API Error ({e.response.status_code}): "
+            error_message_text = f"API Error ({e.response.status_code}): "
             try:
                 # Try to parse remove.bg's JSON error response
                 error_details_json = e.response.json()
                 errors = error_details_json.get('errors', [])
                 if errors and isinstance(errors, list) and len(errors) > 0 and 'title' in errors[0]:
-                    error_message += errors[0]['title']
-                    if 'detail' in errors[0]: error_message += f" - {errors[0]['detail']}"
+                    error_message_text += errors[0]['title']
+                    if 'detail' in errors[0]: error_message_text += f" - {errors[0]['detail']}"
                 else:
-                    error_message += e.response.text[:200] # Show part of the raw text if no title
+                    error_message_text += e.response.text[:200] # Show part of the raw text if no title
             except ValueError: # If response is not JSON
-                error_message += e.response.text[:200]
-            logger.error(f"HTTP error from remove.bg: {error_message} | Full response text: {e.response.text}")
-            await message.reply_text(error_message, reply_markup=get_main_keyboard())
+                error_message_text += e.response.text[:200]
+            logger.error(f"HTTP error from remove.bg: {error_message_text} | Full response text: {e.response.text}")
+            try:
+                await progress_msg.edit_text(error_message_text, reply_markup=get_main_keyboard())
+            except Exception:
+                await message.reply_text(error_message_text, reply_markup=get_main_keyboard()) # Fallback if progress_msg deleted
 
         except requests.exceptions.Timeout:
             logger.error("Request to remove.bg API timed out.")
-            await message.reply_text("The request to the background removal service timed out. Please try again.", reply_markup=get_main_keyboard())
+            try:
+                await progress_msg.edit_text("The request to the background removal service timed out. Please try again.", reply_markup=get_main_keyboard())
+            except Exception:
+                await message.reply_text("The request to the background removal service timed out. Please try again.", reply_markup=get_main_keyboard())
+
         except requests.exceptions.RequestException as e:
             logger.error(f"Request error connecting to remove.bg: {e}")
-            await message.reply_text("Could not connect to the background removal service. Please check your internet or try again later.", reply_markup=get_main_keyboard())
+            try:
+                await progress_msg.edit_text("Could not connect to the background removal service. Please check your internet or try again later.", reply_markup=get_main_keyboard())
+            except Exception:
+                await message.reply_text("Could not connect to the background removal service. Please check your internet or try again later.", reply_markup=get_main_keyboard())
+        
         except Exception as e:
             logger.error(f"An unexpected error occurred during image processing: {e}", exc_info=True)
-            await message.reply_text("An unexpected error occurred while processing your image.", reply_markup=get_main_keyboard())
+            try:
+                await progress_msg.edit_text("An unexpected error occurred while processing your image. Please try again.", reply_markup=get_main_keyboard())
+            except Exception:
+                await message.reply_text("An unexpected error occurred while processing your image. Please try again.", reply_markup=get_main_keyboard())
         finally:
+            # Ensure the state is reset regardless of success or failure
             context.user_data[STATE_WAITING_FOR_IMAGE] = False 
             logger.info(f"User {user_id} state reset from WAITING_FOR_IMAGE.")
     else:
@@ -187,17 +234,19 @@ async def handle_other_messages(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(f"Update {update} caused error {context.error}", exc_info=context.error)
+    # Attempt to clear the state for the user if an error occurs
     if update and hasattr(update, 'effective_user') and update.effective_user:
         context.user_data.pop(STATE_WAITING_FOR_IMAGE, None)
         logger.info(f"Cleared WAITING_FOR_IMAGE state for user {update.effective_user.id if hasattr(update.effective_user, 'id') else 'UnknownUser'} due to error.")
     
+    # Try to send an error message back to the user
     if update and hasattr(update, 'message') and update.message:
         try:
             await update.message.reply_text("Oops! Something went wrong. My circuits are a bit tangled. Please try /start again.", reply_markup=get_main_keyboard())
         except Exception as e_reply:
             logger.error(f"Failed to send error message to user: {e_reply}")
 
-# --- Main Bot Logic --- (No changes needed in main() for this specific quality issue)
+# --- Main Bot Logic ---
 def main():
     logger.info("Starting bot application...")
     try:
@@ -210,12 +259,15 @@ def main():
 
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
+    # Handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(f'^{BTN_REMOVE_BACKGROUND}$'), handle_remove_bg_button_press))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_other_messages))
     application.add_handler(MessageHandler(~filters.TEXT & ~filters.PHOTO & ~filters.COMMAND, handle_other_messages))
+    
+    # Error Handler
     application.add_error_handler(error_handler)
 
     logger.info("Bot polling started...")
