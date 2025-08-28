@@ -4,7 +4,7 @@ import requests
 import asyncio  # Added at the top
 import os       # Added for environment variables
 
-from telegram import Update, InputFile, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, InputFile, ReplyKeyboardMarkup, KeyboardButton, ChatAction
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -12,6 +12,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from asyncio import sleep, CancelledError # Explicitly import sleep and CancelledError
 
 # --- Configuration ---
 # Get sensitive keys from environment variables for better security and deployment
@@ -42,6 +43,19 @@ logger = logging.getLogger(__name__)
 def get_main_keyboard():
     keyboard = [[KeyboardButton(BTN_REMOVE_BACKGROUND)]]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+
+# --- Helper function for continuously sending chat action ---
+async def send_chat_action_periodically(chat_id: int, context: ContextTypes.DEFAULT_TYPE, action_type: ChatAction, interval: int = 4):
+    """Sends a chat action repeatedly until cancelled."""
+    try:
+        while True:
+            await context.bot.send_chat_action(chat_id=chat_id, action=action_type)
+            await sleep(interval)
+    except CancelledError:
+        logger.info(f"Chat action {action_type} for chat {chat_id} was cancelled.")
+    except Exception as e:
+        logger.error(f"Error in send_chat_action_periodically for chat {chat_id}: {e}", exc_info=True)
+
 
 # --- Bot Command Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -80,58 +94,37 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get(STATE_WAITING_FOR_IMAGE) is True:
         logger.info(f"User {user_id} sent a photo while in WAITING_FOR_IMAGE state. Processing...")
 
-        # First send progress message
-        # We explicitly check if this message was successfully sent
+        # Initialize progress_msg to None
         progress_msg = None
-        try:
-            progress_msg = await message.reply_text(
-                "🟩⬜️⬜️⬜️⬜️⬜️⬜️⬜️⬜️ 0%\nProcessing your image...",
-                reply_markup=get_main_keyboard()
-            )
-        except Exception as e:
-            logger.error(f"Failed to send initial progress message to user {user_id}: {e}", exc_info=True)
-            await message.reply_text("Sorry, I couldn't send the initial progress message. Please try again.", reply_markup=get_main_keyboard())
-            context.user_data[STATE_WAITING_FOR_IMAGE] = False
-            return # Exit if initial message fails
-
-        # Fake progress updates before sending to remove.bg
-        steps = [
-            ("🟩⬜️⬜️⬜️⬜️⬜️⬜️⬜️⬜️ 5%", 0.5),
-            ("🟩🟩⬜️⬜️⬜️⬜️⬜️⬜️⬜️ 15%", 0.7),
-            ("🟩🟩🟩⬜️⬜️⬜️⬜️⬜️⬜️ 25%", 0.7),
-            ("🟩🟩🟩🟩⬜️⬜️⬜️⬜️⬜️ 40%", 0.7),
-            ("🟩🟩🟩🟩🟩⬜️⬜️⬜️⬜️ 55%", 0.7),
-            ("🟩🟩🟩🟩🟩🟩⬜️⬜️⬜️ 70%", 0.7),
-            ("🟩🟩🟩🟩🟩🟩🟩⬜️⬜️ 85%", 0.7),
-            ("🟩🟩🟩🟩🟩🟩🟩🟩🟩⬜️ 95%", 0.5), # Corrected to 9 green squares
-        ]
-
-        for text, delay in steps:
-            await asyncio.sleep(delay)
-            if progress_msg: # Only try to edit if the initial message was sent successfully
-                try:
-                    await progress_msg.edit_text(text, reply_markup=get_main_keyboard())
-                except Exception as e:
-                    # Log the error if editing fails, don't just pass silently
-                    logger.warning(f"Failed to edit progress message for user {user_id}. Message might have been deleted by user or an API error occurred: {e}")
-                    # If message edit fails once, it's likely permanently gone/uneditable for this operation.
-                    # We can set progress_msg to None to prevent further edit attempts in this loop.
-                    progress_msg = None 
-                    break # Break out of the loop as further edits will likely also fail
-
-        # --- Actual Image Processing Logic ---
-        photo_file_id = message.photo[-1].file_id # Get the largest available photo from Telegram
-        
-        image_byte_array = None # Initialize to None for error handling
+        # Start a background task to send 'upload_photo' chat action periodically
+        # This will show the user that the bot is actively processing/uploading
+        chat_action_task = asyncio.create_task(
+            send_chat_action_periodically(message.chat_id, context, ChatAction.UPLOAD_PHOTO)
+        )
 
         try:
-            # Update progress message before downloading
+            # Send initial message, which will be updated later
+            try:
+                progress_msg = await message.reply_text(
+                    "✨ Starting image processing...",
+                    reply_markup=get_main_keyboard()
+                )
+            except Exception as e:
+                logger.error(f"Failed to send initial progress message to user {user_id}: {e}", exc_info=True)
+                await message.reply_text("Sorry, I couldn't send the initial progress message. Please try again.", reply_markup=get_main_keyboard())
+                context.user_data[STATE_WAITING_FOR_IMAGE] = False
+                return # Exit if initial message fails
+
+            # --- Actual Image Processing Logic ---
+            photo_file_id = message.photo[-1].file_id # Get the largest available photo from Telegram
+            
+            # Update message to indicate image download
             if progress_msg:
                 try:
-                    await progress_msg.edit_text("🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 100%\nDownloading image...", reply_markup=get_main_keyboard())
+                    await progress_msg.edit_text("⬇️ Downloading your image...", reply_markup=get_main_keyboard())
                 except Exception as e:
-                    logger.warning(f"Failed to edit progress message for user {user_id} during download step: {e}")
-                    progress_msg = None
+                    logger.warning(f"Failed to edit progress message for user {user_id} during download text update: {e}")
+                    progress_msg = None # Stop trying to edit if it failed once
 
             photo_file_obj = await context.bot.get_file(photo_file_id)
             image_byte_array = await photo_file_obj.download_as_bytearray()
@@ -141,18 +134,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             logger.info(f"Downloaded image for processing: {original_filename}, size: {len(image_byte_array)} bytes.")
 
-            # Update progress message before calling remove.bg API
+            # Update message to indicate sending to API
             if progress_msg:
                 try:
-                    await progress_msg.edit_text("🔥 Sending to remove.bg API...", reply_markup=get_main_keyboard())
+                    await progress_msg.edit_text("🚀 Sending image to remove.bg API...", reply_markup=get_main_keyboard())
                 except Exception as e:
-                    logger.warning(f"Failed to edit progress message for user {user_id} during API send step: {e}")
+                    logger.warning(f"Failed to edit progress message for user {user_id} during API send text update: {e}")
                     progress_msg = None
 
             headers = {'X-Api-Key': REMOVE_BG_API_KEY}
             data_payload = {
                 'format': 'png',
-                'size': 'auto', # 'auto' is generally best for free tier to get largest preview
+                'size': 'auto',
             }
             files_payload = {'image_file': image_bytes_io}
             
@@ -166,7 +159,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if 'image/png' not in content_type_header:
                 logger.warning(f"remove.bg did NOT return a PNG as expected. Content-Type: {content_type_header}. This might be an error image or wrong format.")
-                if "image/" in content_type_header: # If it's still an image but wrong type
+                if "image/" in content_type_header:
                     extension = content_type_header.split('/')[-1]
                     output_filename = f'bg_removed_output.{extension}'
                 else: # Definitely not an image, likely an error from API despite status 200
@@ -184,7 +177,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Final update before sending the image
             if progress_msg:
                 try:
-                    await progress_msg.edit_text("✅ Processing Completed!\nSending your result...", reply_markup=get_main_keyboard())
+                    await progress_msg.edit_text("✅ Processing Completed!\n📤 Sending your result...", reply_markup=get_main_keyboard())
                 except Exception as e:
                     logger.warning(f"Failed to edit progress message for user {user_id} during completion step: {e}")
                     progress_msg = None
@@ -197,34 +190,39 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         except requests.exceptions.HTTPError as e:
-            error_message_text = f"API Error ({e.response.status_code}): "
+            error_message_text = f"❌ API Error ({e.response.status_code}): "
             try:
-                # Try to parse remove.bg's JSON error response
                 error_details_json = e.response.json()
                 errors = error_details_json.get('errors', [])
                 if errors and isinstance(errors, list) and len(errors) > 0 and 'title' in errors[0]:
                     error_message_text += errors[0]['title']
                     if 'detail' in errors[0]: error_message_text += f" - {errors[0]['detail']}"
                 else:
-                    error_message_text += e.response.text[:200] # Show part of the raw text if no title
-            except ValueError: # If response is not JSON
+                    error_message_text += e.response.text[:200]
+            except ValueError:
                 error_message_text += e.response.text[:200]
             logger.error(f"HTTP error from remove.bg: {error_message_text} | Full response text: {e.response.text}")
             await (progress_msg.edit_text if progress_msg else message.reply_text)(error_message_text, reply_markup=get_main_keyboard())
 
         except requests.exceptions.Timeout:
             logger.error("Request to remove.bg API timed out.")
-            await (progress_msg.edit_text if progress_msg else message.reply_text)("The request to the background removal service timed out. Please try again.", reply_markup=get_main_keyboard())
+            await (progress_msg.edit_text if progress_msg else message.reply_text)("⏳ The background removal service timed out. Please try again.", reply_markup=get_main_keyboard())
 
         except requests.exceptions.RequestException as e:
             logger.error(f"Request error connecting to remove.bg: {e}")
-            await (progress_msg.edit_text if progress_msg else message.reply_text)("Could not connect to the background removal service. Please check your internet or try again later.", reply_markup=get_main_keyboard())
+            await (progress_msg.edit_text if progress_msg else message.reply_text)("🚫 Could not connect to the background removal service. Please check your internet or try again later.", reply_markup=get_main_keyboard())
         
         except Exception as e:
             logger.error(f"An unexpected error occurred during image processing: {e}", exc_info=True)
-            await (progress_msg.edit_text if progress_msg else message.reply_text)("An unexpected error occurred while processing your image. Please try again.", reply_markup=get_main_keyboard())
+            await (progress_msg.edit_text if progress_msg else message.reply_text)("❓ An unexpected error occurred while processing your image. Please try again.", reply_markup=get_main_keyboard())
         finally:
-            # Ensure the state is reset regardless of success or failure
+            # Always cancel the chat action task in the finally block
+            chat_action_task.cancel()
+            try:
+                await chat_action_task # Await to ensure the cancellation is processed
+            except CancelledError:
+                pass # Expected if task was cancelled
+
             context.user_data[STATE_WAITING_FOR_IMAGE] = False 
             logger.info(f"User {user_id} state reset from WAITING_FOR_IMAGE.")
     else:
