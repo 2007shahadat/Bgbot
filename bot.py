@@ -12,7 +12,7 @@ from telegram.ext import (
 )
 
 # --- Configuration ---
-TELEGRAM_BOT_TOKEN = "7996065957:AAEEyU1x6o5nNNlqhtTsUmS2weKBxkwluv0"
+TELEGRAM_BOT_TOKEN = "7996065957:AAGsFuTi0hkGxOa-IEbVsTLzaQ9R92s28xY"
 REMOVE_BG_API_KEY = "gvoeRyGciuGqfAY6i8Hm5SLc" # Your remove.bg API Key
 REMOVE_BG_API_URL = "https://api.remove.bg/v1.0/removebg"
 
