@@ -1,10 +1,12 @@
 import logging
 import io
 import requests
-import asyncio  # Added at the top
-import os       # Added for environment variables
+import asyncio
+import os
 
-from telegram import Update, InputFile, ReplyKeyboardMarkup, KeyboardButton, ChatAction
+# Changed import: ChatAction is now in telegram.constants for python-telegram-bot v21+
+from telegram import Update, InputFile, ReplyKeyboardMarkup, KeyboardButton
+from telegram.constants import ChatAction # <-- Updated import path for ChatAction
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
